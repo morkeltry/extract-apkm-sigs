@@ -1,0 +1,115 @@
+#!/bin/bash
+set -euo pipefail
+
+APKM_FILE="$1"
+OUTPUT_DIR="$2"
+
+if ! command -v unzip >/dev/null || ! command -v keytool >/dev/null || ! command -v apksigner >/dev/null; then
+  echo "Error: This script requires 'unzip', 'keytool', and 'apksigner' in your PATH."
+  exit 1
+fi
+
+mkdir -p "$OUTPUT_DIR"
+
+echo "### keytool output for $APKM_FILE ###"
+CERT_FILE=$(unzip -l "$APKM_FILE" | awk '/META-INF\/.*\.(RSA|EC|DSA)$/ {print $4; exit}')
+if [[ -z "$CERT_FILE" ]]; then
+  echo "No certificate file found inside APKM archive."
+else
+  unzip -p "$APKM_FILE" "$CERT_FILE" > "$OUTPUT_DIR/temp.cert"
+  keytool -printcert -file "$OUTPUT_DIR/temp.cert"
+  rm "$OUTPUT_DIR/temp.cert"
+fi
+echo "### End keytool output ###"
+echo
+
+echo "Extracting only .apk files from $APKM_FILE into $OUTPUT_DIR..."
+unzip -j -o "$APKM_FILE" '*.apk' -d "$OUTPUT_DIR"
+
+declare -a FIRST_SIGNER_LINES=()
+FIRST_SET=0
+FAILURES=0
+MATCHED_COUNT=0
+
+shopt -s nullglob
+APK_FILES=("$OUTPUT_DIR"/*.apk)
+
+if [[ ${#APK_FILES[@]} -eq 0 ]]; then
+  echo "No APK files found in $OUTPUT_DIR."
+  exit 1
+fi
+
+for apk in "${APK_FILES[@]}"; do
+  APS_OUTPUT=$(apksigner verify --print-certs "$apk" 2>&1)
+
+  SIGNER_LINES=()
+  while IFS= read -r line; do
+    [[ "$line" =~ ^Signer\ #[0-9]+\ certificate ]] && SIGNER_LINES+=("$line")
+  done <<< "$APS_OUTPUT"
+
+  NUM_SIGNERS=${#SIGNER_LINES[@]}
+
+  if (( NUM_SIGNERS > 4 )); then
+    echo "File: $apk"
+    echo "$APS_OUTPUT"
+    echo
+    FAILURES=$((FAILURES + 1))
+    continue
+  fi
+
+  if (( FIRST_SET == 0 )); then
+    FIRST_SIGNER_LINES=("${SIGNER_LINES[@]}")
+    FIRST_SET=1
+    echo "$apk certs:"
+    printf '%s\n' "${FIRST_SIGNER_LINES[@]}"
+    echo
+    MATCHED_COUNT=$((MATCHED_COUNT + 1))
+    continue
+  fi
+
+  if [[ ${#SIGNER_LINES[@]} -ne ${#FIRST_SIGNER_LINES[@]} ]]; then
+    echo "File: $apk"
+    echo "$APS_OUTPUT"
+    echo
+    FAILURES=$((FAILURES + 1))
+    continue
+  fi
+
+  MISMATCH=0
+  for i in "${!SIGNER_LINES[@]}"; do
+    if [[ "${SIGNER_LINES[i]}" != "${FIRST_SIGNER_LINES[i]}" ]]; then
+      MISMATCH=1
+      break
+    fi
+  done
+
+  if (( MISMATCH == 1 )); then
+    echo "File: $apk"
+    echo "$APS_OUTPUT"
+    echo
+    FAILURES=$((FAILURES + 1))
+  else
+    echo "$apk matches"
+    MATCHED_COUNT=$((MATCHED_COUNT + 1))
+  fi
+done
+
+if (( FAILURES == 0 )); then
+  DIRNAME=$(basename "$OUTPUT_DIR")
+  SUMMARY_FILE="$OUTPUT_DIR/${DIRNAME}_cert_sigs.txt"
+  {
+    echo "Archive: $APKM_FILE"
+    printf '%s\n' "${FIRST_SIGNER_LINES[@]}"
+    echo "$MATCHED_COUNT .apk files checked matching"
+  } > "$SUMMARY_FILE"
+  echo "No failures detected. Cert blocks are in $SUMMARY_FILE"
+else
+  echo "Detected $FAILURES failure(s). No summary file created."
+fi
+
+# Cleanup extracted APK files
+echo "Cleaning up extracted .apk files..."
+rm -f "$OUTPUT_DIR"/*.apk
+
+echo "Done."
+
